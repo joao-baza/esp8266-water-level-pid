@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP8266 — Controle PWM</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="card">
+    <h1>Controle manual</h1>
+    <p id="status" class="status">Conectando…</p>
+
+    <section class="sensor">
+      <p class="control-title">HC-SR04 — Distância</p>
+      <p id="distance" class="distance">—</p>
+    </section>
+
+    <section class="control">
+      <p class="control-title">LED</p>
+      <input type="range" id="slider1" class="slider" min="0" max="100" step="1" value="0"
+             onchange="updateSliderPWM(this)">
+      <p class="control-value"><span id="sliderValue1">0</span>%</p>
+    </section>
+
+    <section class="control">
+      <p class="control-title">Buzzer</p>
+      <input type="range" id="slider2" class="slider" min="0" max="100" step="1" value="0"
+             onchange="updateSliderPWM(this)">
+      <p class="control-value"><span id="sliderValue2">0</span>%</p>
+    </section>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>
