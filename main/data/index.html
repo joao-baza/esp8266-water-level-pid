@@ -3,31 +3,85 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ESP8266 — Controle PWM</title>
+  <title>Controle de Nível — PID</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main class="card">
-    <h1>Controle manual</h1>
-    <p id="status" class="status">Conectando…</p>
+    <header class="header">
+      <h1>Controle de Nível — PID</h1>
+      <p id="status" class="status">Conectando…</p>
+    </header>
 
-    <section class="sensor">
-      <p class="control-title">HC-SR04 — Distância</p>
-      <p id="distance" class="distance">—</p>
+    <section class="mode">
+      <p class="control-title">Modo de operação</p>
+      <div class="mode-toggle" role="tablist">
+        <button id="modeManual" class="mode-btn active" type="button" role="tab" aria-selected="true">Manual</button>
+        <button id="modeAuto" class="mode-btn" type="button" role="tab" aria-selected="false">Auto</button>
+      </div>
+    </section>
+
+    <section class="chart-section">
+      <div class="chart-header">
+        <span class="legend"><span class="dot dot-level"></span>Nível</span>
+        <span class="legend"><span class="dot dot-sp"></span>Setpoint</span>
+        <span class="legend-meta">Janela: 120 s</span>
+      </div>
+      <canvas id="chart" class="chart"></canvas>
+    </section>
+
+    <section class="readout">
+      <div class="readout-item">
+        <span class="readout-label">Nível</span>
+        <span class="readout-value"><span id="levelValue">--</span> <small>cm</small></span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">PWM bomba</span>
+        <span class="readout-value"><span id="pwmValue">0</span> <small>%</small></span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">Distância</span>
+        <span class="readout-value"><span id="rawValue">--</span> <small>cm</small></span>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">Alerta</span>
+        <span id="buzValue" class="readout-value buz">inativo</span>
+      </div>
     </section>
 
     <section class="control">
-      <p class="control-title">LED</p>
-      <input type="range" id="slider1" class="slider" min="0" max="100" step="1" value="0"
-             onchange="updateSliderPWM(this)">
-      <p class="control-value"><span id="sliderValue1">0</span>%</p>
+      <div class="control-head">
+        <p class="control-title">Setpoint</p>
+        <span class="control-value"><span id="setpointValue">0.0</span> cm</span>
+      </div>
+      <input type="range" id="setpoint" class="slider" min="0" max="15" step="0.5" value="0">
     </section>
 
-    <section class="control">
-      <p class="control-title">Buzzer</p>
-      <input type="range" id="slider2" class="slider" min="0" max="100" step="1" value="0"
-             onchange="updateSliderPWM(this)">
-      <p class="control-value"><span id="sliderValue2">0</span>%</p>
+    <section id="manualSection" class="control">
+      <div class="control-head">
+        <p class="control-title">Bomba PWM (manual)</p>
+        <span class="control-value"><span id="manualPwm">0</span> %</span>
+      </div>
+      <input type="range" id="slider1" class="slider" min="0" max="100" step="1" value="0">
+    </section>
+
+    <section class="pid-section">
+      <p class="control-title">Ganhos PID</p>
+      <div class="pid-grid">
+        <label>
+          <span>Kp</span>
+          <input type="number" id="kp" step="0.1" value="5.0" inputmode="decimal">
+        </label>
+        <label>
+          <span>Ki</span>
+          <input type="number" id="ki" step="0.1" value="0.5" inputmode="decimal">
+        </label>
+        <label>
+          <span>Kd</span>
+          <input type="number" id="kd" step="0.1" value="0.0" inputmode="decimal">
+        </label>
+      </div>
+      <p class="hint">Lambda tuning: λ = 2·τp, Ti = τp, Td = 0 → Kp = τp / (K·λ), Ki = Kp / Ti</p>
     </section>
   </main>
   <script src="script.js"></script>
