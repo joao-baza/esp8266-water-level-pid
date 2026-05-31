@@ -131,10 +131,11 @@ h1 {
   background: transparent;
   border: 2px dashed #f87171;
 }
+.dot-pwm { background: #4ade80; }
 
 .chart {
   width: 100%;
-  height: 220px;
+  height: 240px;
   display: block;
   border-radius: 6px;
   background: #0b1220;
@@ -176,18 +177,18 @@ h1 {
   margin-left: 2px;
 }
 
-.readout-value.buz {
-  font-size: 1rem;
-  color: #4ade80;
-}
-.readout-value.buz.alert {
-  color: #f87171;
-  animation: pulse 0.9s infinite;
+.alert-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #64748b;
+  flex-shrink: 0;
+  transition: background 0.2s, box-shadow 0.2s;
 }
 
-@keyframes pulse {
-  0%,100% { opacity: 1; }
-  50%     { opacity: 0.55; }
+.alert-dot--on {
+  background: #4ade80;
+  box-shadow: 0 0 10px rgba(74, 222, 128, 0.55);
 }
 
 /* ===== Controles ===== */
@@ -258,7 +259,7 @@ h1 {
 
 .pid-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 0.6rem;
 }
 
@@ -293,10 +294,36 @@ h1 {
   line-height: 1.4;
 }
 
+.alarm-section {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.alarm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.alarm-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  background: #1e293b;
+  border-radius: 8px;
+}
+
+.alarm-hint {
+  margin-top: 0.15rem;
+}
+
 /* ===== Responsivo ===== */
 @media (max-width: 420px) {
   .card { padding: 1rem; }
   .readout { grid-template-columns: 1fr 1fr; }
-  .chart { height: 180px; }
+  .chart { height: 180px; }  /* nível e PWM */
   h1 { font-size: 1.2rem; }
 }

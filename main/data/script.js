@@ -9,6 +9,8 @@ var CHART_WINDOW_MS = 120 * 1000;   // 120s
 var CHART_MAX_POINTS = 480;          // limite de segurança (240 esperados)
 var Y_MIN = 0;
 var Y_MAX = 16;                       // cm — TANK_HEIGHT + folga
+var PWM_Y_MIN = 0;
+var PWM_Y_MAX = 100;                  // % — potência da bomba
 
 // ============================================================
 // ESTADO
@@ -23,13 +25,15 @@ var state = {
   level: 0,
   raw: null,
   kp: 5.0, ki: 0.5, kd: 0.0,
+  alpha: 0.3,
   buz: 0,
+  alrm: true,
   tank: 15.5,
   status: 'waiting',
   t0: null
 };
 
-// Buffer do gráfico: { t: ms relativo, h: cm, sp: cm }
+// Buffer: { t, h, sp (cm), pwm (%) }
 var chartBuffer = [];
 
 // ============================================================
@@ -94,17 +98,56 @@ function applyState(d) {
   if (d.kp !== undefined)        state.kp = d.kp;
   if (d.ki !== undefined)        state.ki = d.ki;
   if (d.kd !== undefined)        state.kd = d.kd;
+  if (d.alpha !== undefined)     state.alpha = d.alpha;
   if (d.buz !== undefined)       state.buz = d.buz;
+  if (d.alrm !== undefined)      state.alrm = d.alrm === 1 || d.alrm === true;
   if (d.tank !== undefined)      state.tank = d.tank;
   if (d.status !== undefined)    state.status = d.status;
 
-  // Adiciona ao buffer apenas quando há nova leitura válida (ok)
-  if (d.t !== undefined && d.h !== undefined && d.status === 'ok') {
-    pushChartPoint(d.t - state.t0, d.h, d.sp !== undefined ? d.sp : state.setpoint);
+  if (d.t !== undefined && d.status === 'ok' && d.h !== undefined) {
+    pushChartPoint(
+      d.t - state.t0,
+      d.h,
+      d.sp !== undefined ? d.sp : state.setpoint,
+      d.pwm !== undefined ? d.pwm : state.pwm
+    );
   }
 
   renderUi();
   drawChart();
+}
+
+// ============================================================
+// SLIDER HELPERS
+// ============================================================
+
+function updateSetpointDisplay(value) {
+  document.getElementById('setpointValue').textContent = parseFloat(value).toFixed(1);
+}
+
+function sendSetpoint(value) {
+  send('sp' + parseFloat(value).toFixed(2));
+}
+
+function updateManualPwmDisplay(value) {
+  document.getElementById('manualPwm').textContent = Math.round(value);
+}
+
+function sendManualPwm(value) {
+  send('1s' + Math.round(value));
+}
+
+function bindSliderWheel(slider, opts) {
+  slider.addEventListener('wheel', function (event) {
+    event.preventDefault();
+    var delta = event.deltaY < 0 ? opts.step : -opts.step;
+    var value = parseFloat(slider.value) + delta;
+    value = Math.max(opts.getMin(), Math.min(opts.getMax(), value));
+    if (value === parseFloat(slider.value)) return;
+    slider.value = value;
+    opts.formatDisplay(value);
+    opts.onSend(value);
+  }, { passive: false });
 }
 
 // ============================================================
@@ -119,25 +162,58 @@ function bindUi() {
     send('modea');
   });
 
+  document.getElementById('alarmOn').addEventListener('click', function () {
+    send('alrm1');
+  });
+  document.getElementById('alarmOff').addEventListener('click', function () {
+    send('alrm0');
+  });
+
   var sp = document.getElementById('setpoint');
   sp.addEventListener('input', function () {
-    document.getElementById('setpointValue').textContent = parseFloat(sp.value).toFixed(1);
+    updateSetpointDisplay(sp.value);
   });
   sp.addEventListener('change', function () {
-    send('sp' + parseFloat(sp.value).toFixed(2));
+    sendSetpoint(sp.value);
+  });
+  bindSliderWheel(sp, {
+    step: 0.1,
+    getMin: function () { return 0; },
+    getMax: function () { return parseFloat(sp.max); },
+    formatDisplay: updateSetpointDisplay,
+    onSend: sendSetpoint
   });
 
   var slider1 = document.getElementById('slider1');
   slider1.addEventListener('input', function () {
-    document.getElementById('manualPwm').textContent = slider1.value;
+    updateManualPwmDisplay(slider1.value);
   });
   slider1.addEventListener('change', function () {
-    send('1s' + slider1.value);
+    sendManualPwm(slider1.value);
+  });
+  bindSliderWheel(slider1, {
+    step: 1,
+    getMin: function () { return 0; },
+    getMax: function () { return 100; },
+    formatDisplay: updateManualPwmDisplay,
+    onSend: sendManualPwm
   });
 
   bindNumberInput('kp');
   bindNumberInput('ki');
   bindNumberInput('kd');
+  bindAlphaInput();
+}
+
+function bindAlphaInput() {
+  var el = document.getElementById('alpha');
+  el.addEventListener('change', function () {
+    var v = parseFloat(el.value);
+    if (isNaN(v)) v = 0.3;
+    v = Math.max(0.05, Math.min(1, v));
+    el.value = v.toFixed(2);
+    send('em' + v.toFixed(3));
+  });
 }
 
 function bindNumberInput(id) {
@@ -156,8 +232,6 @@ function bindNumberInput(id) {
 function renderUi() {
   setText('levelValue', state.level.toFixed(2));
   setText('pwmValue', state.pwm);
-  setText('rawValue', state.raw !== null && state.raw !== undefined
-                       ? state.raw.toFixed(1) : '--');
 
   setText('setpointValue', state.setpoint.toFixed(1));
   var spEl = document.getElementById('setpoint');
@@ -171,15 +245,24 @@ function renderUi() {
   syncNumber('kp', state.kp);
   syncNumber('ki', state.ki);
   syncNumber('kd', state.kd);
+  syncNumber('alpha', state.alpha);
 
   var buzEl = document.getElementById('buzValue');
-  if (state.buz > 0) {
-    buzEl.textContent = 'ATIVO ' + state.buz + '%';
-    buzEl.classList.add('alert');
+  var alertActive = state.alrm && state.buz > 0;
+  buzEl.classList.toggle('alert-dot--on', alertActive);
+  if (!state.alrm) {
+    buzEl.setAttribute('aria-label', 'Alarme desligado');
+  } else if (alertActive) {
+    buzEl.setAttribute('aria-label', 'Alarme ativo, ' + state.buz + '%');
   } else {
-    buzEl.textContent = 'inativo';
-    buzEl.classList.remove('alert');
+    buzEl.setAttribute('aria-label', 'Alarme ligado, sem alerta');
   }
+
+  var alarmOn = state.alrm;
+  document.getElementById('alarmOn').classList.toggle('active', alarmOn);
+  document.getElementById('alarmOff').classList.toggle('active', !alarmOn);
+  document.getElementById('alarmOn').setAttribute('aria-pressed', alarmOn);
+  document.getElementById('alarmOff').setAttribute('aria-pressed', !alarmOn);
 
   var manualSection = document.getElementById('manualSection');
   manualSection.classList.toggle('hidden', state.mode !== 'manual');
@@ -212,7 +295,7 @@ function setStatusText(text) {
 }
 
 // ============================================================
-// CHART (Canvas 2D)
+// CHART (Canvas 2D) — nível, setpoint e PWM sobrepostos, 120 s
 // ============================================================
 
 var canvas, ctx, dpr = 1;
@@ -232,9 +315,8 @@ function resizeChart() {
   drawChart();
 }
 
-function pushChartPoint(tRel, h, sp) {
-  chartBuffer.push({ t: tRel, h: h, sp: sp });
-  // Mantém buffer dentro da janela; tolera burst com guarda extra
+function pushChartPoint(tRel, h, sp, pwm) {
+  chartBuffer.push({ t: tRel, h: h, sp: sp, pwm: pwm });
   var cutoff = tRel - CHART_WINDOW_MS;
   while (chartBuffer.length > 0 && chartBuffer[0].t < cutoff) chartBuffer.shift();
   while (chartBuffer.length > CHART_MAX_POINTS) chartBuffer.shift();
@@ -245,47 +327,56 @@ function drawChart() {
   var W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
 
-  // Fundo
   ctx.fillStyle = '#0b1220';
   ctx.fillRect(0, 0, W, H);
 
-  // Margens
-  var ml = 36 * dpr, mr = 12 * dpr, mt = 12 * dpr, mb = 22 * dpr;
+  var ml = 36 * dpr, mr = 40 * dpr, mt = 12 * dpr, mb = 22 * dpr;
   var plotW = W - ml - mr;
   var plotH = H - mt - mb;
   if (plotW < 10 || plotH < 10) return;
 
-  // Eixo: janela = 120s; X cresce para a direita; tNow é o último ponto
-  var tNow = chartBuffer.length > 0
-    ? chartBuffer[chartBuffer.length - 1].t
-    : 0;
+  var tNow = chartBuffer.length > 0 ? chartBuffer[chartBuffer.length - 1].t : 0;
   var tStart = tNow - CHART_WINDOW_MS;
 
   function xOf(t) {
     return ml + ((t - tStart) / CHART_WINDOW_MS) * plotW;
   }
-  function yOf(v) {
+  function yLevel(v) {
     var clamped = Math.max(Y_MIN, Math.min(Y_MAX, v));
     return mt + (1 - (clamped - Y_MIN) / (Y_MAX - Y_MIN)) * plotH;
   }
+  function yPwm(v) {
+    var clamped = Math.max(PWM_Y_MIN, Math.min(PWM_Y_MAX, v));
+    return mt + (1 - (clamped - PWM_Y_MIN) / (PWM_Y_MAX - PWM_Y_MIN)) * plotH;
+  }
 
-  // Grid horizontal a cada 2 cm
   ctx.strokeStyle = '#1e293b';
   ctx.lineWidth = 1 * dpr;
   ctx.font = (10 * dpr) + 'px system-ui, sans-serif';
-  ctx.fillStyle = '#64748b';
+
+  // Eixo esquerdo — nível (cm), mesma cor da curva de nível
+  ctx.fillStyle = '#38bdf8';
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  for (var v = Y_MIN; v <= Y_MAX; v += 2) {
-    var y = yOf(v);
+  for (var lv = Y_MIN; lv <= Y_MAX; lv += 2) {
+    var yL = yLevel(lv);
     ctx.beginPath();
-    ctx.moveTo(ml, y);
-    ctx.lineTo(W - mr, y);
+    ctx.moveTo(ml, yL);
+    ctx.lineTo(W - mr, yL);
     ctx.stroke();
-    ctx.fillText(v + '', ml - 4 * dpr, y);
+    ctx.fillText(lv + '', ml - 4 * dpr, yL);
   }
 
-  // Grid vertical a cada 30s
+  // Eixo direito — PWM bomba (%), mesma cor da curva PWM
+  ctx.fillStyle = '#4ade80';
+  ctx.textAlign = 'left';
+  for (var pv = PWM_Y_MIN; pv <= PWM_Y_MAX; pv += 25) {
+    var yP = yPwm(pv);
+    ctx.fillText(pv + '%', W - mr + 4 * dpr, yP);
+  }
+
+  // Eixo temporal
+  ctx.fillStyle = '#64748b';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   for (var sec = 0; sec <= 120; sec += 30) {
@@ -299,36 +390,28 @@ function drawChart() {
     ctx.fillText(label, tx, H - mb + 4 * dpr);
   }
 
-  // Borda do plot
   ctx.strokeStyle = '#334155';
   ctx.strokeRect(ml, mt, plotW, plotH);
 
   if (chartBuffer.length === 0) return;
 
-  // Linha do setpoint (vermelho tracejado)
-  ctx.save();
-  ctx.setLineDash([6 * dpr, 5 * dpr]);
-  ctx.strokeStyle = '#f87171';
-  ctx.lineWidth = 2 * dpr;
-  ctx.beginPath();
-  for (var i = 0; i < chartBuffer.length; i++) {
-    var p = chartBuffer[i];
-    var x = xOf(p.t);
-    var y = yOf(p.sp);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  function strokeSeries(getY, color, dashed) {
+    ctx.beginPath();
+    for (var i = 0; i < chartBuffer.length; i++) {
+      var p = chartBuffer[i];
+      var x = xOf(p.t);
+      var y = getY(p);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.save();
+    if (dashed) ctx.setLineDash([6 * dpr, 5 * dpr]);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2 * dpr;
+    ctx.stroke();
+    ctx.restore();
   }
-  ctx.stroke();
-  ctx.restore();
 
-  // Linha de nível (azul sólido)
-  ctx.strokeStyle = '#38bdf8';
-  ctx.lineWidth = 2 * dpr;
-  ctx.beginPath();
-  for (var j = 0; j < chartBuffer.length; j++) {
-    var pj = chartBuffer[j];
-    var xj = xOf(pj.t);
-    var yj = yOf(pj.h);
-    if (j === 0) ctx.moveTo(xj, yj); else ctx.lineTo(xj, yj);
-  }
-  ctx.stroke();
+  strokeSeries(function (p) { return yLevel(p.sp); }, '#f87171', true);
+  strokeSeries(function (p) { return yLevel(p.h); }, '#38bdf8', false);
+  strokeSeries(function (p) { return yPwm(p.pwm); }, '#4ade80', false);
 }
