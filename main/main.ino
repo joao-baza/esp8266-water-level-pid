@@ -60,8 +60,21 @@ AsyncWebSocket ws("/ws");
 // ============================================================
 
 #define TANK_HEIGHT        15.5f   // cm — altura útil do cilindro
-#define SENSOR_TO_BOTTOM   17.5f   // cm — distância sensor → fundo
+#define RAW_AT_EMPTY       16.6f   // cm — distância bruta com tanque vazio (nível 0)
+#define RAW_AT_FULL         1.7f   // cm — distância bruta com tanque cheio (nível máx.)
+#define RAW_SPAN           (RAW_AT_EMPTY - RAW_AT_FULL)   // 14,9 cm
+#define LEVEL_SCALE        (TANK_HEIGHT / RAW_SPAN)       // cm de nível por cm de raw
 #define LEVEL_MAX          TANK_HEIGHT
+
+// Buzzer: margens em nível (cm) → convertidas para distância bruta
+#define ALERT_ABOVE_BOTTOM_CM  2.0f   // início alerta baixo — 2 cm do fundo (h = 2)
+#define ALERT_BELOW_TOP_CM     1.0f   // início alerta alto — 1 cm do topo (h = 14,5)
+#define RAW_AT_LEVEL_CM(h)    (RAW_AT_EMPTY - (h) * RAW_SPAN / TANK_HEIGHT)
+
+#define BUZZER_BOTTOM_START   RAW_AT_LEVEL_CM(ALERT_ABOVE_BOTTOM_CM)
+#define BUZZER_BOTTOM_MAX     RAW_AT_EMPTY
+#define BUZZER_TOP_START      RAW_AT_LEVEL_CM(TANK_HEIGHT - ALERT_BELOW_TOP_CM)
+#define BUZZER_TOP_MAX        RAW_AT_FULL
 
 // ============================================================
 // TIMING
@@ -95,7 +108,11 @@ struct SensorFilter {
   bool  initialized;
 };
 
-SensorFilter levelFilter = { 0.3f, 0.0f, false };
+#define FILTER_ALPHA_DEFAULT  0.3f
+#define FILTER_ALPHA_MIN      0.05f
+#define FILTER_ALPHA_MAX      1.0f
+
+SensorFilter levelFilter = { FILTER_ALPHA_DEFAULT, 0.0f, false };
 
 // --- 3.2 Controlador PID -------------------------------------
 struct PIDController {
@@ -126,14 +143,18 @@ PIDController pid = {
 
 // --- 3.3 Buzzer de alerta progressivo ------------------------
 struct BuzzerAlert {
-  float topStart;      // 6.0 cm — distância bruta onde inicia alerta de água alta
-  float topMax;        // 4.0 cm — alerta máximo (água muito alta)
-  float bottomStart;   // 15.0 cm — distância bruta onde inicia alerta de água baixa
-  float bottomMax;     // 18.0 cm — alerta máximo (água muito baixa)
+  float topStart;      // raw em h = TANK_HEIGHT − 1 cm (início alerta alto)
+  float topMax;        // raw no cheio — alerta máximo
+  float bottomStart;   // raw em h = 2 cm (início alerta baixo)
+  float bottomMax;     // raw no vazio — alerta máximo
   uint8_t pwmPercent;  // 0–100 — saída atual em % (para broadcast/log)
 };
 
-BuzzerAlert buzzer = { 6.0f, 4.0f, 15.0f, 18.0f, 0 };
+BuzzerAlert buzzer = {
+  BUZZER_TOP_START, BUZZER_TOP_MAX,
+  BUZZER_BOTTOM_START, BUZZER_BOTTOM_MAX,
+  0
+};
 
 // --- 3.4 Gerenciamento de modo -------------------------------
 enum SystemMode { MODE_MANUAL, MODE_AUTO };
@@ -152,6 +173,8 @@ ModeManager mode = { MODE_MANUAL, 0 };
 float    rawDistanceCm = -1.0f;     // última leitura bruta válida (cm)
 float    waterHeightCm = 0.0f;      // nível filtrado (cm)
 uint8_t  pumpPwmPercent = 0;        // saída final da bomba (0–100%)
+uint8_t  buzzerLevelPercent = 0;    // intensidade calculada pelo nível (0–100%)
+bool     alarmEnabled = true;       // false = buzzer sempre mudo
 bool     hasValidReading = false;
 const char* sensorStatus = "waiting";   // waiting | ok | timeout
 
@@ -162,6 +185,7 @@ const char* sensorStatus = "waiting";   // waiting | ok | timeout
 void IRAM_ATTR echoISR();
 uint8_t percentToPWM(float percent);
 float clampf(float v, float lo, float hi);
+float rawToLevelCm(float rawDistance);
 
 void initFS();
 void initWiFi();
@@ -169,6 +193,7 @@ void initWebServer();
 void initWebSocket();
 void updateSensor();
 void applyPwmOutputs();
+void updateBuzzerOutput();
 
 float filterUpdate(SensorFilter& f, float reading);
 void  pidReset(PIDController& c, float currentError, unsigned long now);
@@ -207,6 +232,12 @@ float clampf(float v, float lo, float hi) {
 uint8_t percentToPWM(float percent) {
   percent = clampf(percent, 0.0f, 100.0f);
   return (uint8_t)((percent * PWM_RANGE + 50.0f) / 100.0f);
+}
+
+/** Converte distância bruta do HC-SR04 em nível (cm), calibrado em vazio e cheio. */
+float rawToLevelCm(float rawDistance) {
+  return clampf((RAW_AT_EMPTY - rawDistance) * LEVEL_SCALE,
+                0.0f, TANK_HEIGHT);
 }
 
 // ============================================================
@@ -292,11 +323,9 @@ float pidCompute(PIDController& c, float pv, unsigned long now, bool& saturated)
 /**
  * Retorna o nível de alerta em % (0–100) com base na distância bruta.
  *
- * Zona segura: bottomStart > raw > topStart   → 0%
- * Água alta:   raw <= topStart                → rampa 0..100% ao decrescer até topMax
- *              raw <= topMax                  → 100%
- * Água baixa:  raw >= bottomStart             → rampa 0..100% ao crescer até bottomMax
- *              raw >= bottomMax               → 100%
+ * Zona segura: 2 cm < h < 14,5 cm  → 0%
+ * Água alta:   h ≥ 14,5 cm (1 cm do topo) → rampa até cheio
+ * Água baixa:  h ≤ 2 cm (2 cm do fundo)   → rampa até vazio
  */
 uint8_t buzzerCompute(const BuzzerAlert& b, float rawDistance) {
   if (rawDistance < 0) return 0;   // sem leitura válida
@@ -339,6 +368,15 @@ void setMode(ModeManager& m, SystemMode target) {
 // PWM OUTPUT
 // ============================================================
 
+void updateBuzzerOutput() {
+  if (rawDistanceCm < 0) {
+    buzzerLevelPercent = 0;
+  } else {
+    buzzerLevelPercent = buzzerCompute(buzzer, rawDistanceCm);
+  }
+  buzzer.pwmPercent = alarmEnabled ? buzzerLevelPercent : 0;
+}
+
 void applyPwmOutputs() {
   analogWrite(PUMP_PWM_PIN,   percentToPWM(pumpPwmPercent));
   analogWrite(BUZZER_PWM_PIN, percentToPWM(buzzer.pwmPercent));
@@ -359,7 +397,9 @@ String getStateJson() {
   j += ",\"kp\":"; j += String(pid.Kp, 3);
   j += ",\"ki\":"; j += String(pid.Ki, 3);
   j += ",\"kd\":"; j += String(pid.Kd, 3);
-  j += ",\"buz\":"; j += String(buzzer.pwmPercent);
+  j += ",\"alpha\":"; j += String(levelFilter.alpha, 3);
+  j += ",\"buz\":"; j += String(buzzerLevelPercent);
+  j += ",\"alrm\":"; j += (alarmEnabled ? 1 : 0);
   j += ",\"status\":\""; j += sensorStatus; j += "\"";
   j += ",\"tank\":"; j += String(TANK_HEIGHT, 2);
   j += ",\"t\":"; j += String(millis());
@@ -382,8 +422,11 @@ void notifyClients(const String& msg) {
  *   kp<v>      — ganho proporcional
  *   ki<v>      — ganho integral
  *   kd<v>      — ganho derivativo
+ *   em<v>      — alpha do filtro EMA do nível (0,05–1)
  *   modem      — modo Manual
  *   modea      — modo Auto
+ *   alrm1      — alarme ligado (conforme nível)
+ *   alrm0      — alarme desligado (buzzer mudo)
  *   getValues  — solicita estado atual
  */
 void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) {
@@ -437,10 +480,28 @@ void handleWebSocketMessage(void* arg, uint8_t* data, size_t len) {
     return;
   }
 
+  if (msg.startsWith("em")) {
+    float v = msg.substring(2).toFloat();
+    levelFilter.alpha = clampf(v, FILTER_ALPHA_MIN, FILTER_ALPHA_MAX);
+    Serial.printf("[Filter alpha] %.3f\n", levelFilter.alpha);
+    notifyClients(getStateJson());
+    return;
+  }
+
   if (msg.startsWith("mode")) {
     char c = msg.length() > 4 ? msg.charAt(4) : 'm';
     setMode(mode, c == 'a' ? MODE_AUTO : MODE_MANUAL);
     Serial.printf("[Mode] %s\n", mode.current == MODE_AUTO ? "AUTO" : "MANUAL");
+    notifyClients(getStateJson());
+    return;
+  }
+
+  if (msg.startsWith("alrm")) {
+    char c = msg.length() > 4 ? msg.charAt(4) : '1';
+    alarmEnabled = (c != '0');
+    updateBuzzerOutput();
+    applyPwmOutputs();
+    Serial.printf("[Alarm] %s\n", alarmEnabled ? "ON" : "OFF");
     notifyClients(getStateJson());
     return;
   }
@@ -532,8 +593,8 @@ void setup() {
   sensorTimer = millis();
 
   Serial.println("\n=== System Started ===");
-  Serial.printf("Tank: %.1f cm | Sensor->bottom: %.1f cm | Step: %d ms\n",
-                TANK_HEIGHT, SENSOR_TO_BOTTOM, SENSOR_INTERVAL_MS);
+  Serial.printf("Tank: %.1f cm | Raw empty: %.1f | Raw full: %.1f | Step: %d ms\n",
+                TANK_HEIGHT, RAW_AT_EMPTY, RAW_AT_FULL, SENSOR_INTERVAL_MS);
 }
 
 // ============================================================
@@ -582,12 +643,11 @@ void updateSensor() {
         hasValidReading = true;
         sensorStatus    = "ok";
 
-        // 1) Buzzer opera na distância bruta — segurança não pode ter lag
-        buzzer.pwmPercent = buzzerCompute(buzzer, rawDistanceCm);
+        // 1) Buzzer na distância bruta (respeita alarmEnabled)
+        updateBuzzerOutput();
 
-        // 2) Calcula altura instantânea e aplica filtro EMA
-        float instantHeight = clampf(SENSOR_TO_BOTTOM - rawDistanceCm,
-                                     0.0f, TANK_HEIGHT);
+        // 2) Calcula altura instantânea (2 pontos) e aplica filtro EMA
+        float instantHeight = rawToLevelCm(rawDistanceCm);
         waterHeightCm = filterUpdate(levelFilter, instantHeight);
 
         // 3) Em modo Auto, calcula PID; em Manual, usa slider
