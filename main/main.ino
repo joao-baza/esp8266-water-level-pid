@@ -4,13 +4,7 @@
 #include <ESPAsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include "LittleFS.h"
-
-// ============================================================
-// WIFI CREDENTIALS
-// ============================================================
-
-const char* ssid     = "SUA_REDE";
-const char* password = "SUA_SENHA";
+#include "secrets.h"
 
 // ============================================================
 // WEB SERVER
