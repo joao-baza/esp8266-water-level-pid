@@ -1,15 +1,4 @@
-/**
- * Project: Controle PID de Nível de Água
- * Platform: ESP8266 (NodeMCU) + HC-SR04 (topo) + Bomba PWM + Buzzer
- *
- * Arquitetura modular em main.ino com structs coesas:
- *   SensorFilter   — filtragem EMA do nível
- *   PIDController  — cálculo PID com anti-windup
- *   BuzzerAlert    — alerta progressivo (opera na distância bruta)
- *   ModeManager    — alternância Manual/Auto com bumpless transfer
- *
- * Não-bloqueante: leitura do HC-SR04 via state machine + ISR no echo.
- */
+/** Controle PID de Nível de Água — ESP8266 + HC-SR04 + Bomba PWM + Buzzer */
 
 #include <ESP8266WiFi.h>
 #include <ESPAsyncTCP.h>
@@ -60,15 +49,16 @@ AsyncWebSocket ws("/ws");
 // ============================================================
 
 #define TANK_HEIGHT        15.5f   // cm — altura útil do cilindro
-#define RAW_AT_EMPTY       16.6f   // cm — distância bruta com tanque vazio (nível 0)
+#define RAW_AT_EMPTY       16.28f  // cm — distância bruta com tanque vazio (nível 0)
 #define RAW_AT_FULL         1.7f   // cm — distância bruta com tanque cheio (nível máx.)
-#define RAW_SPAN           (RAW_AT_EMPTY - RAW_AT_FULL)   // 14,9 cm
+#define RAW_SPAN           (RAW_AT_EMPTY - RAW_AT_FULL)   // 14,58 cm
 #define LEVEL_SCALE        (TANK_HEIGHT / RAW_SPAN)       // cm de nível por cm de raw
 #define LEVEL_MAX          TANK_HEIGHT
+#define PUMP_CUTOFF_LEVEL_CM  15.0f   // desliga bomba ao atingir — protege sensor ultrassônico
 
 // Buzzer: margens em nível (cm) → convertidas para distância bruta
 #define ALERT_ABOVE_BOTTOM_CM  2.0f   // início alerta baixo — 2 cm do fundo (h = 2)
-#define ALERT_BELOW_TOP_CM     1.0f   // início alerta alto — 1 cm do topo (h = 14,5)
+#define ALERT_BELOW_TOP_CM     2.0f   // início alerta alto — 2 cm do topo (h = 13,5)
 #define RAW_AT_LEVEL_CM(h)    (RAW_AT_EMPTY - (h) * RAW_SPAN / TANK_HEIGHT)
 
 #define BUZZER_BOTTOM_START   RAW_AT_LEVEL_CM(ALERT_ABOVE_BOTTOM_CM)
@@ -101,7 +91,6 @@ unsigned long sensorTimer = 0;
 // MODELOS DE DADOS — STRUCTS
 // ============================================================
 
-// --- 3.1 Filtro EMA do sensor --------------------------------
 struct SensorFilter {
   float alpha;        // fator de suavização (0..1)
   float filtered;     // valor filtrado atual
@@ -114,7 +103,6 @@ struct SensorFilter {
 
 SensorFilter levelFilter = { FILTER_ALPHA_DEFAULT, 0.0f, false };
 
-// --- 3.2 Controlador PID -------------------------------------
 struct PIDController {
   float Kp, Ki, Kd;            // ganhos ajustáveis pelo frontend
   float setpoint;              // altura desejada (cm)
@@ -141,9 +129,8 @@ PIDController pid = {
   /* initialized */ false
 };
 
-// --- 3.3 Buzzer de alerta progressivo ------------------------
 struct BuzzerAlert {
-  float topStart;      // raw em h = TANK_HEIGHT − 1 cm (início alerta alto)
+  float topStart;      // raw em h = 13,5 cm (início alerta alto)
   float topMax;        // raw no cheio — alerta máximo
   float bottomStart;   // raw em h = 2 cm (início alerta baixo)
   float bottomMax;     // raw no vazio — alerta máximo
@@ -156,7 +143,6 @@ BuzzerAlert buzzer = {
   0
 };
 
-// --- 3.4 Gerenciamento de modo -------------------------------
 enum SystemMode { MODE_MANUAL, MODE_AUTO };
 
 struct ModeManager {
@@ -288,8 +274,7 @@ float pidCompute(PIDController& c, float pv, unsigned long now, bool& saturated)
 
   float error = c.setpoint - pv;
 
-  // Anti-windup condicional: só integra se a saída anterior NÃO estava saturada
-  // OU se o erro está empurrando o integral para fora da saturação.
+  // Anti-windup: integra sempre; se saturar na mesma direção do erro, reverte o incremento.
   float tentativeIntegral = c.integral + error * dt;
   tentativeIntegral = clampf(tentativeIntegral, -c.integralMax, c.integralMax);
   c.integral = tentativeIntegral;
@@ -303,8 +288,6 @@ float pidCompute(PIDController& c, float pv, unsigned long now, bool& saturated)
   float clamped = clampf(output, c.outputMin, c.outputMax);
   saturated = (output != clamped);
 
-  // Se saturou empurrando o integral pra mesma direção, "puxa de volta"
-  // o último incremento (clamping clássico de anti-windup).
   if (saturated && ((error > 0 && output > c.outputMax) ||
                     (error < 0 && output < c.outputMin))) {
     c.integral -= error * dt;
@@ -323,8 +306,8 @@ float pidCompute(PIDController& c, float pv, unsigned long now, bool& saturated)
 /**
  * Retorna o nível de alerta em % (0–100) com base na distância bruta.
  *
- * Zona segura: 2 cm < h < 14,5 cm  → 0%
- * Água alta:   h ≥ 14,5 cm (1 cm do topo) → rampa até cheio
+ * Zona segura: 2 cm < h < 13,5 cm  → 0%
+ * Água alta:   h ≥ 13,5 cm (2 cm do topo) → rampa até cheio
  * Água baixa:  h ≤ 2 cm (2 cm do fundo)   → rampa até vazio
  */
 uint8_t buzzerCompute(const BuzzerAlert& b, float rawDistance) {
@@ -659,6 +642,12 @@ void updateSensor() {
           pumpPwmPercent = mode.manualPwmPercent;
         }
 
+        // Intertravamento: desliga bomba na leitura bruta (sem atraso do filtro EMA)
+        if (instantHeight >= PUMP_CUTOFF_LEVEL_CM) {
+          pumpPwmPercent = 0;
+          pid.integral = 0.0f;   // evita repique do PID ao voltar abaixo do limite
+        }
+
         // 4) Broadcast do estado completo
         notifyClients(getStateJson());
 
@@ -675,8 +664,6 @@ void updateSensor() {
       // Timeout — descartar leitura sem corromper o filtro
       if (now - sensorTimer > ECHO_TIMEOUT_MS) {
         sensorStatus = "timeout";
-        // Mantém último rawDistanceCm; em modo Auto o PID continua com
-        // a última altura conhecida (degradação controlada).
         notifyClients(getStateJson());
 
         Serial.println("[HC-SR04] Timeout — no echo received");
