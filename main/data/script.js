@@ -5,12 +5,16 @@
 // ============================================================
 
 var GATEWAY = 'ws://' + window.location.hostname + '/ws';
-var CHART_WINDOW_MS = 120 * 1000;   // 120s
-var CHART_MAX_POINTS = 480;          // limite de segurança (240 esperados)
+var CHART_WINDOW_MS = 180 * 1000;   // 180s
+var CHART_WINDOW_S = CHART_WINDOW_MS / 1000;
+var CHART_MAX_POINTS = 960;
 var Y_MIN = 0;
-var Y_MAX = 16;                       // cm — TANK_HEIGHT + folga
+var Y_MAX = 15.5;                       // cm — limite de proteção da bomba / escala do gráfico
 var PWM_Y_MIN = 0;
 var PWM_Y_MAX = 100;                  // % — potência da bomba
+var ERR_Y_MIN = 0;
+var ERR_Y_MAX = 100;                  // % — erro |nível − setpoint|
+var COLOR_ERR = '#fb923c';            // laranja — curva de erro %
 
 // ============================================================
 // ESTADO
@@ -33,7 +37,7 @@ var state = {
   t0: null
 };
 
-// Buffer: { t, h, sp (cm), pwm (%) }
+// Buffer: { t, h, sp (cm), pwm (%), err (%) }
 var chartBuffer = [];
 
 // ============================================================
@@ -41,6 +45,8 @@ var chartBuffer = [];
 // ============================================================
 
 window.addEventListener('load', function () {
+  var legendMeta = document.querySelector('.legend-meta');
+  if (legendMeta) legendMeta.textContent = 'Janela: ' + CHART_WINDOW_S + ' s';
   bindUi();
   initChart();
   initWebSocket();
@@ -295,7 +301,7 @@ function setStatusText(text) {
 }
 
 // ============================================================
-// CHART (Canvas 2D) — nível, setpoint e PWM sobrepostos, 120 s
+// CHART (Canvas 2D) — nível, setpoint e PWM sobrepostos, 180 s
 // ============================================================
 
 var canvas, ctx, dpr = 1;
@@ -305,6 +311,9 @@ function initChart() {
   ctx = canvas.getContext('2d');
   resizeChart();
   window.addEventListener('resize', resizeChart);
+  if (window.ResizeObserver && canvas.parentElement) {
+    new ResizeObserver(resizeChart).observe(canvas.parentElement);
+  }
 }
 
 function resizeChart() {
@@ -315,8 +324,13 @@ function resizeChart() {
   drawChart();
 }
 
+function chartErrPct(h, sp) {
+  var tank = state.tank > 0 ? state.tank : Y_MAX;
+  return Math.min(ERR_Y_MAX, Math.max(ERR_Y_MIN, Math.abs(h - sp) / tank * 100));
+}
+
 function pushChartPoint(tRel, h, sp, pwm) {
-  chartBuffer.push({ t: tRel, h: h, sp: sp, pwm: pwm });
+  chartBuffer.push({ t: tRel, h: h, sp: sp, pwm: pwm, err: chartErrPct(h, sp) });
   var cutoff = tRel - CHART_WINDOW_MS;
   while (chartBuffer.length > 0 && chartBuffer[0].t < cutoff) chartBuffer.shift();
   while (chartBuffer.length > CHART_MAX_POINTS) chartBuffer.shift();
@@ -349,6 +363,10 @@ function drawChart() {
     var clamped = Math.max(PWM_Y_MIN, Math.min(PWM_Y_MAX, v));
     return mt + (1 - (clamped - PWM_Y_MIN) / (PWM_Y_MAX - PWM_Y_MIN)) * plotH;
   }
+  function yErr(v) {
+    var clamped = Math.max(ERR_Y_MIN, Math.min(ERR_Y_MAX, v));
+    return mt + (1 - (clamped - ERR_Y_MIN) / (ERR_Y_MAX - ERR_Y_MIN)) * plotH;
+  }
 
   ctx.strokeStyle = '#1e293b';
   ctx.lineWidth = 1 * dpr;
@@ -367,8 +385,8 @@ function drawChart() {
     ctx.fillText(lv + '', ml - 4 * dpr, yL);
   }
 
-  // Eixo direito — PWM bomba (%), mesma cor da curva PWM
-  ctx.fillStyle = '#4ade80';
+  // Eixo direito — PWM e erro (%), escala 0–100
+  ctx.fillStyle = '#64748b';
   ctx.textAlign = 'left';
   for (var pv = PWM_Y_MIN; pv <= PWM_Y_MAX; pv += 25) {
     var yP = yPwm(pv);
@@ -379,14 +397,15 @@ function drawChart() {
   ctx.fillStyle = '#64748b';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
-  for (var sec = 0; sec <= 120; sec += 30) {
-    var tx = ml + (sec / 120) * plotW;
+  var tickStep = 60;
+  for (var sec = 0; sec <= CHART_WINDOW_S; sec += tickStep) {
+    var tx = ml + (sec / CHART_WINDOW_S) * plotW;
     ctx.beginPath();
     ctx.moveTo(tx, mt);
     ctx.lineTo(tx, H - mb);
     ctx.stroke();
-    var label = '-' + (120 - sec) + 's';
-    if (sec === 120) label = 'agora';
+    var label = '-' + (CHART_WINDOW_S - sec) + 's';
+    if (sec === CHART_WINDOW_S) label = 'agora';
     ctx.fillText(label, tx, H - mb + 4 * dpr);
   }
 
@@ -414,4 +433,5 @@ function drawChart() {
   strokeSeries(function (p) { return yLevel(p.sp); }, '#f87171', true);
   strokeSeries(function (p) { return yLevel(p.h); }, '#38bdf8', false);
   strokeSeries(function (p) { return yPwm(p.pwm); }, '#4ade80', false);
+  strokeSeries(function (p) { return yErr(p.err); }, COLOR_ERR, false);
 }
